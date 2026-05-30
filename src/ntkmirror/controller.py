@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import time
@@ -32,6 +33,8 @@ class SignedLogMaskState:
     raw: torch.Tensor
     max_log_gate: float
     model_name: str | None = None
+    hook_site: str = "layer_output"
+    theory_version: str = "activation_control"
 
     @property
     def n_gates(self) -> int:
@@ -47,6 +50,8 @@ class SignedLogMaskState:
             "raw": self.raw.detach().cpu(),
             "max_log_gate": float(self.max_log_gate),
             "model_name": self.model_name,
+            "hook_site": self.hook_site,
+            "theory_version": self.theory_version,
         }
 
     @classmethod
@@ -60,6 +65,8 @@ class SignedLogMaskState:
             raw=torch.as_tensor(obj["raw"], dtype=torch.float32),
             max_log_gate=float(obj["max_log_gate"]),
             model_name=obj.get("model_name"),
+            hook_site=str(obj.get("hook_site", "layer_output")),
+            theory_version=str(obj.get("theory_version", "activation_control")),
         )
 
     def save(self, path: str | Path) -> None:
@@ -82,6 +89,8 @@ class SignedLogMaskState:
 class _SignedLogMaskModule(nn.Module):
     """Small trainable module attached by forward hooks."""
 
+    VALID_HOOK_SITES = {"layer_output", "layer_input"}
+
     def __init__(
         self,
         layers: Sequence[nn.Module],
@@ -90,6 +99,7 @@ class _SignedLogMaskModule(nn.Module):
         *,
         hidden_size: int,
         max_log_gate: float,
+        hook_site: str = "layer_output",
         raw_init: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -98,18 +108,56 @@ class _SignedLogMaskModule(nn.Module):
         self.layers = layers
         self.hidden_size = int(hidden_size)
         self.max_log_gate = float(max_log_gate)
+        self.hook_site = str(hook_site)
+        if self.hook_site not in self.VALID_HOOK_SITES:
+            raise ValueError(f"hook_site must be one of {sorted(self.VALID_HOOK_SITES)}")
         self.register_buffer("layer_indices", layer_indices.detach().clone().long())
         self.register_buffer("channel_indices", channel_indices.detach().clone().long())
         if raw_init is None:
             raw_init = torch.zeros(int(layer_indices.numel()), dtype=torch.float32)
         self.raw = nn.Parameter(raw_init.detach().clone().float())
+        self._signed_log_override: torch.Tensor | None = None
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._rebuild_index()
 
     @property
     def s(self) -> torch.Tensor:
+        override = self._signed_log_override
+        if override is not None:
+            return override
         return self.max_log_gate * torch.tanh(self.raw)
+
+    @property
+    def is_attached(self) -> bool:
+        return bool(self._handles)
+
+    @staticmethod
+    def raw_from_signed_log_values(values: torch.Tensor, max_log_gate: float) -> torch.Tensor:
+        mg = float(max_log_gate)
+        if mg <= 0:
+            raise ValueError("max_log_gate must be positive")
+        x = torch.clamp(values.float() / mg, -0.999999, 0.999999)
+        return 0.5 * torch.log((1.0 + x) / (1.0 - x))
+
+    @torch.no_grad()
+    def set_signed_log_values_(self, values: torch.Tensor) -> None:
+        vals = values.detach().to(device=self.raw.device, dtype=torch.float32).reshape_as(self.raw)
+        vals = torch.clamp(vals, -self.max_log_gate, self.max_log_gate)
+        self.raw.copy_(self.raw_from_signed_log_values(vals, self.max_log_gate).to(self.raw.device))
+
+    @torch.no_grad()
+    def add_signed_log_values_(self, delta: torch.Tensor, *, scale: float = 1.0) -> None:
+        self.set_signed_log_values_(self.s.detach().float() + float(scale) * delta.detach().float().to(self.raw.device))
+
+    @contextlib.contextmanager
+    def temporary_signed_log_values(self, values: torch.Tensor):
+        old = self._signed_log_override
+        self._signed_log_override = values
+        try:
+            yield
+        finally:
+            self._signed_log_override = old
 
     def _rebuild_index(self) -> None:
         self._by_layer.clear()
@@ -122,12 +170,33 @@ class _SignedLogMaskModule(nn.Module):
         if self._handles:
             return
         for layer_id in self._by_layer:
-            self._handles.append(self.layers[layer_id].register_forward_hook(self._make_hook(layer_id)))
+            if self.hook_site == "layer_input":
+                self._handles.append(self.layers[layer_id].register_forward_pre_hook(self._make_pre_hook(layer_id)))
+            else:
+                self._handles.append(self.layers[layer_id].register_forward_hook(self._make_hook(layer_id)))
 
     def remove(self) -> None:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+
+    def _scale_hidden(self, h: torch.Tensor, layer_id: int) -> torch.Tensor:
+        pos, ch = self._by_layer[layer_id]
+        pos = pos.to(device=h.device)
+        ch = ch.to(device=h.device)
+        scale = torch.ones(self.hidden_size, dtype=h.dtype, device=h.device)
+        scale[ch] = torch.exp(self.s.to(device=h.device, dtype=h.dtype)[pos])
+        return h * scale.view(1, 1, -1)
+
+    def _make_pre_hook(self, layer_id: int):
+        def hook(_module, inputs):
+            if not inputs:
+                return inputs
+            h = inputs[0]
+            if not torch.is_tensor(h):
+                raise TypeError("layer_input hook expected first positional input to be a tensor")
+            return (self._scale_hidden(h, layer_id),) + tuple(inputs[1:])
+        return hook
 
     def _make_hook(self, layer_id: int):
         def hook(_module, _inputs, output):
@@ -137,12 +206,7 @@ class _SignedLogMaskModule(nn.Module):
             else:
                 h = output
                 rest = None
-            pos, ch = self._by_layer[layer_id]
-            pos = pos.to(device=h.device)
-            ch = ch.to(device=h.device)
-            scale = torch.ones(self.hidden_size, dtype=h.dtype, device=h.device)
-            scale[ch] = torch.exp(self.s.to(device=h.device, dtype=h.dtype)[pos])
-            h = h * scale.view(1, 1, -1)
+            h = self._scale_hidden(h, layer_id)
             if rest is None:
                 return h
             return (h,) + rest
@@ -158,21 +222,39 @@ class _SignedLogMaskModule(nn.Module):
             raw=self.raw.detach().cpu(),
             max_log_gate=self.max_log_gate,
             model_name=model_name,
+            hook_site=self.hook_site,
+            theory_version="activation_control",
         )
 
 
 class _ActivationScoreCapture:
-    """Retain decoder layer activations and their gradients for gate scoring."""
+    """Retain decoder-layer input/output activations and their gradients for gate scoring."""
 
-    def __init__(self, layers: Sequence[nn.Module], layer_ids: Sequence[int]) -> None:
+    def __init__(self, layers: Sequence[nn.Module], layer_ids: Sequence[int], *, hook_site: str) -> None:
         self.captured: dict[int, torch.Tensor] = {}
-        self._handles = [layers[i].register_forward_hook(self._make_hook(i)) for i in layer_ids]
+        self.hook_site = str(hook_site)
+        if self.hook_site == "layer_input":
+            self._handles = [layers[i].register_forward_pre_hook(self._make_pre_hook(i)) for i in layer_ids]
+        elif self.hook_site == "layer_output":
+            self._handles = [layers[i].register_forward_hook(self._make_hook(i)) for i in layer_ids]
+        else:
+            raise ValueError("hook_site must be 'layer_input' or 'layer_output'")
+
+    def _retain(self, idx: int, h: torch.Tensor) -> None:
+        h.retain_grad()
+        self.captured[idx] = h
+
+    def _make_pre_hook(self, idx: int):
+        def hook(_module, inputs):
+            if inputs and torch.is_tensor(inputs[0]):
+                self._retain(idx, inputs[0])
+            return inputs
+        return hook
 
     def _make_hook(self, idx: int):
         def hook(_module, _inputs, output):
             h = output[0] if isinstance(output, tuple) else output
-            h.retain_grad()
-            self.captured[idx] = h
+            self._retain(idx, h)
             return output
         return hook
 
@@ -210,11 +292,15 @@ class ForwardFineTuner:
         gates: int = 5000,
         layers: str = "all",
         max_log_gate: float = 0.05,
+        hook_site: str = "layer_output",
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.gates = int(gates)
         self.max_log_gate = float(max_log_gate)
+        self.hook_site = str(hook_site)
+        if self.hook_site not in _SignedLogMaskModule.VALID_HOOK_SITES:
+            raise ValueError(f"hook_site must be one of {sorted(_SignedLogMaskModule.VALID_HOOK_SITES)}")
         self.layer_path, self.decoder_layers = find_decoder_layers(model)
         self.hidden_size = infer_hidden_size(model)
         self.layer_ids = parse_layers(layers, len(self.decoder_layers))
@@ -284,7 +370,7 @@ class ForwardFineTuner:
         device = _device_of(self.model)
         scores = torch.zeros((len(self.decoder_layers), self.hidden_size), dtype=torch.float32, device="cpu")
         self.model.train(False)
-        capture = _ActivationScoreCapture(self.decoder_layers, self.layer_ids)
+        capture = _ActivationScoreCapture(self.decoder_layers, self.layer_ids, hook_site=self.hook_site)
 
         # Hidden states need a gradient source. Enabling the input embedding is
         # the least invasive option and is restored immediately afterwards.
@@ -330,6 +416,35 @@ class ForwardFineTuner:
         channel_indices = channel.to(torch.long).cpu()
         return layer_indices, channel_indices
 
+    def initialize_controller(
+        self,
+        examples: Sequence[Example],
+        *,
+        score_batches: int = 16,
+        batch_size: int = 8,
+        max_length: int = 1024,
+    ) -> dict[str, float]:
+        """Score and initialise the sparse activation-control gate basis."""
+        _freeze(self.model)
+        device = _device_of(self.model)
+        t0 = time.perf_counter()
+        layer_indices, channel_indices = self._score_gates(
+            examples, score_batches=score_batches, batch_size=batch_size, max_length=max_length
+        )
+        self.controller = _SignedLogMaskModule(
+            self.decoder_layers,
+            layer_indices.to(device),
+            channel_indices.to(device),
+            hidden_size=self.hidden_size,
+            max_log_gate=self.max_log_gate,
+            hook_site=self.hook_site,
+        ).to(device)
+        return {
+            "selected_gates": float(self.controller.raw.numel()),
+            "select_seconds": float(time.perf_counter() - t0),
+            "hook_site": self.hook_site,
+        }
+
     def fit(
         self,
         examples: Sequence[Example],
@@ -348,18 +463,12 @@ class ForwardFineTuner:
         _freeze(self.model)
         device = _device_of(self.model)
 
-        t0 = time.perf_counter()
-        layer_indices, channel_indices = self._score_gates(
+        init_stats = self.initialize_controller(
             examples, score_batches=score_batches, batch_size=batch_size, max_length=max_length
         )
-        self.controller = _SignedLogMaskModule(
-            self.decoder_layers,
-            layer_indices.to(device),
-            channel_indices.to(device),
-            hidden_size=self.hidden_size,
-            max_log_gate=self.max_log_gate,
-        ).to(device)
-        select_seconds = time.perf_counter() - t0
+        select_seconds = float(init_stats["select_seconds"])
+        if self.controller is None:
+            raise RuntimeError("controller initialisation failed")
 
         opt = torch.optim.AdamW([self.controller.raw], lr=lr, weight_decay=weight_decay)
         train_batches = list(batches(examples, batch_size))
@@ -391,6 +500,137 @@ class ForwardFineTuner:
             "train_seconds": float(train_seconds),
             "loss_first": float(losses[0]) if losses else math.nan,
             "loss_last": float(losses[-1]) if losses else math.nan,
+            "hook_site": self.hook_site,
+        }
+
+    def secant_diagnostics(
+        self,
+        examples: Sequence[Example],
+        *,
+        alphas: Sequence[float] = (0.125, 0.25, 0.5, 0.75, 1.0),
+        drift_alphas: Sequence[float] = (0.0625, 0.1875, 0.375, 0.625, 0.875),
+        eps: float = 1e-3,
+        batch_size: int = 2,
+        max_length: int = 1024,
+        projection: str = "target",
+        top_k: int = 32,
+    ) -> dict:
+        if self.controller is None:
+            raise ValueError("load, fit, or initialize a controller before diagnostics")
+        from .dual import controller_secant_diagnostics
+        return controller_secant_diagnostics(
+            self.model, self.tokenizer, self.controller, examples,
+            alphas=alphas, drift_alphas=drift_alphas, eps=eps,
+            batch_size=batch_size, max_length=max_length, projection=projection, top_k=top_k,
+        ).to_dict()
+
+    def dual_projection_diagnostics(
+        self,
+        support_examples: Sequence[Example],
+        calibration_examples: Sequence[Example] | None = None,
+        *,
+        batch_size: int = 1,
+        max_length: int = 1024,
+        projection: str = "target",
+        top_k: int = 32,
+        target_step_size: float = 1e-5,
+        ridge: float = 1e-4,
+        cg_iters: int = 16,
+        cg_tol: float = 1e-5,
+        fd_eps: float = 1e-3,
+        metric: str = "identity",
+        metric_eps: float = 1e-6,
+        jvp_mode: str = "exact",
+        param_name_substrings: Sequence[str] | None = None,
+        max_target_parameters: int = 0,
+    ) -> dict:
+        if self.controller is None:
+            raise ValueError("load, fit, or initialize a controller before diagnostics")
+        from .dual import dual_projection_diagnostics
+        solution, _target = dual_projection_diagnostics(
+            self.model, self.tokenizer, self.controller, support_examples, calibration_examples,
+            batch_size=batch_size, max_length=max_length, projection=projection, top_k=top_k,
+            target_step_size=target_step_size, ridge=ridge, cg_iters=cg_iters, cg_tol=cg_tol,
+            fd_eps=fd_eps, metric=metric, metric_eps=metric_eps, jvp_mode=jvp_mode,
+            param_name_substrings=param_name_substrings, max_target_parameters=max_target_parameters,
+        )
+        return solution.diagnostics.to_dict()
+
+    def fit_dual(
+        self,
+        examples: Sequence[Example],
+        *,
+        steps: int = 8,
+        target_step_size: float = 1e-5,
+        apply_scale: float = 1.0,
+        batch_size: int = 1,
+        score_batches: int = 16,
+        max_length: int = 1024,
+        projection: str = "target",
+        top_k: int = 32,
+        ridge: float = 1e-4,
+        cg_iters: int = 16,
+        cg_tol: float = 1e-5,
+        fd_eps: float = 1e-3,
+        metric: str = "identity",
+        metric_eps: float = 1e-6,
+        jvp_mode: str = "exact",
+        param_name_substrings: Sequence[str] | None = None,
+        max_target_parameters: int = 0,
+        verbose: bool = True,
+    ) -> dict:
+        if not examples:
+            raise ValueError("fit_dual requires at least one example")
+        if self.controller is None:
+            init_stats = self.initialize_controller(
+                examples, score_batches=score_batches, batch_size=batch_size, max_length=max_length
+            )
+        else:
+            init_stats = {"selected_gates": float(self.controller.raw.numel()), "select_seconds": 0.0, "hook_site": self.hook_site}
+        if self.controller is None:
+            raise RuntimeError("controller initialisation failed")
+        from .dual import dual_projection_diagnostics
+        train_batches = list(batches(examples, batch_size))
+        rows: list[dict] = []
+        start = time.perf_counter()
+        for step in range(int(steps)):
+            chunk = train_batches[step % len(train_batches)]
+            solution, _target = dual_projection_diagnostics(
+                self.model, self.tokenizer, self.controller, chunk, chunk,
+                batch_size=batch_size, max_length=max_length, projection=projection, top_k=top_k,
+                target_step_size=target_step_size, ridge=ridge, cg_iters=cg_iters, cg_tol=cg_tol,
+                fd_eps=fd_eps, metric=metric, metric_eps=metric_eps, jvp_mode=jvp_mode,
+                param_name_substrings=param_name_substrings, max_target_parameters=max_target_parameters,
+            )
+            update = solution.update.to(device=_device_of(self.model), dtype=torch.float32)
+            before_s = self.controller.s.detach().float().clone()
+            intended = float(apply_scale) * update.detach().float().to(before_s.device)
+            self.controller.add_signed_log_values_(update, scale=apply_scale)
+            after_s = self.controller.s.detach().float().clone()
+            applied = after_s - before_s
+            clip_delta = intended - applied
+            row = solution.diagnostics.to_dict()
+            row["step"] = float(step + 1)
+            row["apply_scale"] = float(apply_scale)
+            row["applied_update_norm"] = float(torch.linalg.vector_norm(applied).item())
+            row["clip_update_residual"] = float(torch.linalg.vector_norm(clip_delta).item() / max(float(torch.linalg.vector_norm(intended).item()), 1e-30))
+            row["clip_fraction"] = float((clip_delta.abs() > 1e-7).float().mean().item()) if clip_delta.numel() else 0.0
+            rows.append(row)
+            if verbose:
+                print(
+                    f"dual step {step+1:4d}/{steps}: "
+                    f"realized={row['realized_residual']:.4f} range={row['range_residual']:.4f} "
+                    f"cos={row['realized_cosine']:.4f} adj={row['adjoint_error']:.1e} "
+                    f"sym={row['symmetry_error']:.1e} |u|={row['update_norm']:.4g} "
+                    f"clip={row['clip_fraction']:.2%}",
+                    flush=True,
+                )
+        return {
+            "mode": "pathwise_activation_control_ntk",
+            "init": init_stats,
+            "steps": rows,
+            "train_seconds": float(time.perf_counter() - start),
+            "selected_gates": float(self.controller.raw.numel()),
         }
 
     def save(self, path: str | Path) -> None:
@@ -422,8 +662,10 @@ class ForwardFineTuner:
             state.channel_indices.to(device),
             hidden_size=self.hidden_size,
             max_log_gate=state.max_log_gate,
+            hook_site=state.hook_site,
             raw_init=state.raw.to(device),
         ).to(device)
+        self.hook_site = state.hook_site
         return self
 
     @torch.no_grad()
@@ -464,5 +706,7 @@ class ForwardFineTuner:
             "hidden_size": self.hidden_size,
             "gates": self.selected_gates_json(),
             "max_log_gate": self.max_log_gate,
+            "hook_site": self.hook_site,
+            "theory_version": "activation_control",
         }
         Path(path).write_text(json.dumps(obj, indent=2), encoding="utf-8")

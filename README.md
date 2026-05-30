@@ -202,12 +202,92 @@ retrieval quality, not controller storage. For production, replace the retriever
 with an embedding or hybrid vector-store layer and keep the same `compose_states`
 interface. See `docs/persistent_memory.md`.
 
+
+## Activation-control NTK tools
+
+The `fit` command trains signed log-gates by support NLL and remains the
+deployable path. A separate research path adds diagnostics and a field-locked
+fitting harness for the stricter NTK-dual claim: the local activation-control
+tangent
+
+```text
+B_C(s) = d(P_C z(s)) / ds
+```
+
+should realise the full frozen-model weight-SGD projected-logit field
+
+```text
+d_C^theta = -eta J_{theta,C} J_{theta,S}^T g_S .
+```
+
+`Bv` is an exact autograd JVP, `B^T y` is an exact VJP, and the CG operator is
+`B M^{-1} B^T + ridge I`. Reports include `adjoint_error`, `symmetry_error`,
+`range_residual`, and the actual forward `realized_residual`; `field_residual`
+is the realised-forward residual, not the same local matvec used inside the
+solve.
+
+Audit whether a selected gate basis can realise the full-weight field:
+
+```bash
+ntkmirror dual-diagnose \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --support train.jsonl \
+  --calibration eval.jsonl \
+  --controller controller.pt \
+  --projection topk --top-k 32 \
+  --target-step-size 1e-5 \
+  --jvp-mode exact \
+  --metric activation
+```
+
+Fit pathwise by matching the full-weight NTK field instead of using support-Adam:
+
+```bash
+ntkmirror fit-dual \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --train train.jsonl \
+  --out controller_dual.pt \
+  --steps 8 \
+  --projection topk --top-k 32 \
+  --jvp-mode exact \
+  --metric activation
+```
+
+Check whether a finite controller has left the initial gate tangent:
+
+```bash
+ntkmirror secant \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --controller controller.pt \
+  --eval eval.jsonl
+```
+
+The important numbers are `range_residual` and `realized_residual`, not raw
+gate norm. A large `secant` error only says the initial gate chart is no longer
+a global linear model; it does not by itself refute pathwise NTK duality. See
+`docs/activation_control_ntk.md` for the theory, command details, and failure
+mode checklist.
+
+A safe diffusion scale-gate runner is also included:
+
+```bash
+python scripts/diffusion/train_scale_gate_adam_m.py \
+  --image-dir images \
+  --prompts "a photo of sks dog" \
+  --out runs/diffusion_scale_gates.pt \
+  --steps 1500
+```
+
+It uses Adam with a step-adaptive activation metric and `cosh` self-damping, and
+represents channel pruning with finite `q_prune` hard-dead masks, separate
+q/shift caps, and non-finite guards.
+
 ## What this repo is not
 
-This is the simple deployable package. It intentionally does not expose the full
-research harness for NTK-vector diagnostics, oracle SGD-displacement fitting, or
-matrix-free theorem checks. Those are useful for papers; they make a bad first
-user experience.
+The default UX remains the simple deployable support-Adam package. The
+diagnostic and field-locked commands expose a research harness for NTK-vector
+diagnostics and field-locked local updates; they are slower than `fit` and are
+not the default first-run path.
 
 ## Notes for benchmark claims
 

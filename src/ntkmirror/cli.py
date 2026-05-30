@@ -59,6 +59,7 @@ def _make_tuner(args) -> ForwardFineTuner:
         gates=getattr(args, "gates", 5000),
         layers=getattr(args, "layers", "all"),
         max_log_gate=getattr(args, "max_log_gate", 0.05),
+        hook_site=getattr(args, "hook_site", "layer_output"),
     )
 
 
@@ -75,6 +76,13 @@ def _parse_weights(s: str | None, n: int) -> list[float]:
     if len(vals) != n:
         raise ValueError(f"expected {n} weights, got {len(vals)}")
     return vals
+
+
+def _parse_param_filter(s: str | None) -> list[str] | None:
+    if s is None or not str(s).strip():
+        return None
+    vals = [x.strip() for x in str(s).split(",") if x.strip()]
+    return vals or None
 
 
 def _memory_text_from_examples(examples) -> str:
@@ -118,6 +126,103 @@ def cmd_fit(args) -> None:
         "after": after,
         "fit": fit_stats,
     }, indent=2), flush=True)
+
+
+def cmd_fit_dual(args) -> None:
+    examples = load_jsonl_examples(args.train)
+    tuner = _make_tuner(args)
+    before = tuner.evaluate_nll(examples, batch_size=args.batch_size, max_length=args.max_length, use_controller=False)
+    fit_stats = tuner.fit_dual(
+        examples,
+        steps=args.steps,
+        target_step_size=args.target_step_size,
+        apply_scale=args.apply_scale,
+        batch_size=args.batch_size,
+        score_batches=args.score_batches,
+        max_length=args.max_length,
+        projection=args.projection,
+        top_k=args.top_k,
+        ridge=args.ridge,
+        cg_iters=args.cg_iters,
+        cg_tol=args.cg_tol,
+        fd_eps=args.fd_eps,
+        metric=args.metric,
+        metric_eps=args.metric_eps,
+        jvp_mode=args.jvp_mode,
+        param_name_substrings=_parse_param_filter(args.param_filter),
+        max_target_parameters=args.max_target_parameters,
+        verbose=not args.quiet,
+    )
+    after = tuner.evaluate_nll(examples, batch_size=args.batch_size, max_length=args.max_length)
+    tuner.save(args.out)
+    manifest_path = str(Path(args.out).with_suffix(".manifest.json"))
+    tuner.write_manifest(manifest_path)
+    result = {
+        "controller": args.out,
+        "manifest": manifest_path,
+        "train_examples": len(examples),
+        "before": before,
+        "after": after,
+        "fit_dual": fit_stats,
+    }
+    if args.report:
+        _write_json(args.report, result)
+    print(json.dumps(result, indent=2), flush=True)
+
+
+def cmd_secant(args) -> None:
+    examples = load_jsonl_examples(args.eval)
+    tuner = _make_tuner(args)
+    tuner.load(args.controller)
+    report = tuner.secant_diagnostics(
+        examples,
+        eps=args.fd_eps,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        projection=args.projection,
+        top_k=args.top_k,
+    )
+    if args.out:
+        _write_json(args.out, report)
+    print(json.dumps(report, indent=2), flush=True)
+
+
+def cmd_dual_diagnose(args) -> None:
+    support = load_jsonl_examples(args.support)
+    calibration = load_jsonl_examples(args.calibration) if args.calibration else None
+    tuner = _make_tuner(args)
+    if args.controller:
+        tuner.load(args.controller)
+        init = {"source": args.controller}
+    else:
+        init = tuner.initialize_controller(
+            support,
+            score_batches=args.score_batches,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+        )
+    report = tuner.dual_projection_diagnostics(
+        support,
+        calibration,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        projection=args.projection,
+        top_k=args.top_k,
+        target_step_size=args.target_step_size,
+        ridge=args.ridge,
+        cg_iters=args.cg_iters,
+        cg_tol=args.cg_tol,
+        fd_eps=args.fd_eps,
+        metric=args.metric,
+        metric_eps=args.metric_eps,
+        jvp_mode=args.jvp_mode,
+        param_name_substrings=_parse_param_filter(args.param_filter),
+        max_target_parameters=args.max_target_parameters,
+    )
+    report["basis"] = init
+    if args.out:
+        _write_json(args.out, report)
+    print(json.dumps(report, indent=2), flush=True)
 
 
 def cmd_eval(args) -> None:
@@ -369,6 +474,7 @@ def _add_tuner_args(p: argparse.ArgumentParser, *, demo: bool = False) -> None:
     p.add_argument("--score-batches", type=int, default=4 if demo else 16)
     p.add_argument("--layers", default="all")
     p.add_argument("--max-log-gate", type=float, default=0.05)
+    p.add_argument("--hook-site", default="layer_output", choices=["layer_output", "layer_input"])
     p.add_argument("--max-length", type=int, default=512 if demo else 1024)
 
 
@@ -396,6 +502,77 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tuner_args(fit)
     fit.add_argument("--quiet", action="store_true")
     fit.set_defaults(func=cmd_fit)
+
+    fit_dual = sub.add_parser(
+        "fit-dual",
+        help="experimental pathwise activation-control NTK fit against full-weight SGD fields",
+    )
+    _add_common_model_args(fit_dual)
+    fit_dual.add_argument("--train", required=True)
+    fit_dual.add_argument("--out", required=True)
+    fit_dual.add_argument("--report", default=None)
+    _add_tuner_args(fit_dual)
+    fit_dual.add_argument("--projection", default="target", choices=["target", "topk", "full"])
+    fit_dual.add_argument("--top-k", type=int, default=32)
+    fit_dual.add_argument("--target-step-size", type=float, default=1e-5)
+    fit_dual.add_argument("--apply-scale", type=float, default=1.0)
+    fit_dual.add_argument("--ridge", type=float, default=1e-4)
+    fit_dual.add_argument("--cg-iters", type=int, default=16)
+    fit_dual.add_argument("--cg-tol", type=float, default=1e-5)
+    fit_dual.add_argument("--fd-eps", type=float, default=1e-3, help="legacy finite-difference epsilon; only used with --jvp-mode fd")
+    fit_dual.add_argument("--jvp-mode", default="exact", choices=["exact", "fd"], help="exact uses autograd JVP; fd is a legacy diagnostic fallback")
+    fit_dual.add_argument("--metric", default="identity", choices=["identity", "activation"], help="gate metric M in BM^-1B^T")
+    fit_dual.add_argument("--metric-eps", type=float, default=1e-6)
+    fit_dual.add_argument("--param-filter", default=None, help="comma substrings of model parameter names to include in the full-weight target")
+    fit_dual.add_argument("--max-target-parameters", type=int, default=0, help="0 disables the guard; otherwise fail above this many differentiated parameters")
+    fit_dual.add_argument("--quiet", action="store_true")
+    fit_dual.set_defaults(func=cmd_fit_dual)
+
+    sec = sub.add_parser("secant", help="diagnose finite controller departure from the initial gate tangent")
+    _add_common_model_args(sec)
+    sec.add_argument("--controller", required=True)
+    sec.add_argument("--eval", required=True)
+    sec.add_argument("--out", default=None)
+    sec.add_argument("--batch-size", type=int, default=1)
+    sec.add_argument("--max-length", type=int, default=1024)
+    sec.add_argument("--projection", default="target", choices=["target", "topk", "full"])
+    sec.add_argument("--top-k", type=int, default=32)
+    sec.add_argument("--fd-eps", type=float, default=1e-3)
+    sec.add_argument("--gates", type=int, default=5000)
+    sec.add_argument("--layers", default="all")
+    sec.add_argument("--max-log-gate", type=float, default=0.05)
+    sec.add_argument("--hook-site", default="layer_output", choices=["layer_output", "layer_input"])
+    sec.set_defaults(func=cmd_secant)
+
+    diag = sub.add_parser(
+        "dual-diagnose",
+        help="test whether the full-weight SGD field lies in the selected gate tangent range",
+    )
+    _add_common_model_args(diag)
+    diag.add_argument("--support", required=True)
+    diag.add_argument("--calibration", default=None)
+    diag.add_argument("--controller", default=None, help="existing controller basis; if omitted, score a fresh zero basis")
+    diag.add_argument("--out", default=None)
+    diag.add_argument("--gates", type=int, default=5000)
+    diag.add_argument("--layers", default="all")
+    diag.add_argument("--max-log-gate", type=float, default=0.05)
+    diag.add_argument("--hook-site", default="layer_output", choices=["layer_output", "layer_input"])
+    diag.add_argument("--score-batches", type=int, default=16)
+    diag.add_argument("--batch-size", type=int, default=1)
+    diag.add_argument("--max-length", type=int, default=1024)
+    diag.add_argument("--projection", default="target", choices=["target", "topk", "full"])
+    diag.add_argument("--top-k", type=int, default=32)
+    diag.add_argument("--target-step-size", type=float, default=1e-5)
+    diag.add_argument("--ridge", type=float, default=1e-4)
+    diag.add_argument("--cg-iters", type=int, default=16)
+    diag.add_argument("--cg-tol", type=float, default=1e-5)
+    diag.add_argument("--fd-eps", type=float, default=1e-3, help="legacy finite-difference epsilon; only used with --jvp-mode fd")
+    diag.add_argument("--jvp-mode", default="exact", choices=["exact", "fd"], help="exact uses autograd JVP; fd is a legacy diagnostic fallback")
+    diag.add_argument("--metric", default="identity", choices=["identity", "activation"], help="gate metric M in BM^-1B^T")
+    diag.add_argument("--metric-eps", type=float, default=1e-6)
+    diag.add_argument("--param-filter", default=None, help="comma substrings of model parameter names to include in the full-weight target")
+    diag.add_argument("--max-target-parameters", type=int, default=0, help="0 disables the guard; otherwise fail above this many differentiated parameters")
+    diag.set_defaults(func=cmd_dual_diagnose)
 
     ev = sub.add_parser("eval", help="evaluate base and optionally controller NLL/token accuracy")
     _add_common_model_args(ev)

@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 datasets = ["datasets>=2.20"]
 retrieval = ["sentence-transformers>=3.0"]
+diffusion = ["diffusers>=0.30", "pillow>=10"]
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
